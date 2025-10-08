@@ -83,7 +83,7 @@ def check_command(command):
     """
     if command.lower() == "hungry":
         open_servo(servo_food, "servo food")
-        sleep(2)
+        sleep(4)
         close_servo(servo_food, "servo food")
     else:
         close_servo(servo_food, "servo food")

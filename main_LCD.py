@@ -9,10 +9,11 @@ import os
 import wave
 from PIL import Image
 import tflite_runtime.interpreter as tflite
-
+from RPLCD.i2c import CharLCD  
 
 # MQTT Setup
-BROKER = "broker.hivemq.com"  
+
+BROKER = "broker.hivemq.com"
 PORT = 1883
 USERNAME = None
 PASSWORD = None
@@ -44,18 +45,29 @@ servo_food = Servo(SERVO1_PIN)
 servo_door = Servo(SERVO2_PIN)
 
 
+# LCD Setup (I2C)
+
+try:
+    lcd = CharLCD('PCF8574', 0x27) 
+    lcd.clear()
+    lcd.write_string(" Pet Care Booting")
+    sleep(2)
+    lcd.clear()
+except Exception as e:
+    lcd = None
+    print("[LCD] Not detected. Running without display:", e)
+
+
 # Load AI Models
 
 print("Loading TFLite models...")
 
-#YAMNet model 
 yamnet = tflite.Interpreter(model_path="yamnet.tflite")
 yamnet.allocate_tensors()
 yamnet_input = yamnet.get_input_details()
 yamnet_output = yamnet.get_output_details()
 YAMNET_INPUT_SIZE = yamnet_input[0]['shape'][0]
 
-#MobileNet Pet Detector 
 pet_model_path = "mobilenet_pet.tflite"
 pet_interpreter = tflite.Interpreter(model_path=pet_model_path)
 pet_interpreter.allocate_tensors()
@@ -63,13 +75,21 @@ pet_input = pet_interpreter.get_input_details()
 pet_output = pet_interpreter.get_output_details()
 
 
+def lcd_display(line1="", line2=""):
+    """Display message on LCD if available."""
+    if lcd:
+        lcd.clear()
+        lcd.write_string(line1[:16])
+        lcd.crlf()
+        lcd.write_string(line2[:16])
+
 def capture_image(filename="snapshot.jpg"):
     folder = "snapshots"
     os.makedirs(folder, exist_ok=True)
     filepath = os.path.join(folder, filename)
 
     picam2 = Picamera2()
-    sleep(2)  
+    sleep(2)
     picam2.start()
     picam2.capture_file(filepath)
     picam2.stop()
@@ -77,50 +97,43 @@ def capture_image(filename="snapshot.jpg"):
     return filepath
 
 def is_pet_in_image(image_path, threshold=0.5):
-    """Run MobileNet to detect if a pet is in the image."""
     img = Image.open(image_path).resize((224, 224))
     input_data = np.expand_dims(np.array(img) / 255.0, axis=0).astype(np.float32)
     pet_interpreter.set_tensor(pet_input[0]['index'], input_data)
     pet_interpreter.invoke()
     output = pet_interpreter.get_tensor(pet_output[0]['index'])
-    output = np.array(output).flatten()
-    pet_prob = output[0]
+    pet_prob = np.array(output).flatten()[0]
     print(f"[AI] Pet probability: {pet_prob:.2f}")
     return pet_prob > threshold
 
 def predict_sound_emotion(audio_path="received_audio.wav"):
-    """Run YAMNet to classify audio emotion."""
-    with wave.open(audio_path, 'rb') as wf:
-        frames = wf.readframes(wf.getnframes())
-        audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
-    audio_data = audio_data / 32768.0  # normalize to [-1,1]
+    try:
+        with wave.open(audio_path, 'rb') as wf:
+            frames = wf.readframes(wf.getnframes())
+            audio_data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+        audio_data = audio_data / 32768.0
 
-    preds = []
-    for start in range(0, len(audio_data) - YAMNET_INPUT_SIZE + 1, YAMNET_INPUT_SIZE):
-        chunk = audio_data[start:start + YAMNET_INPUT_SIZE]
-        yamnet.set_tensor(yamnet_input[0]['index'], chunk.astype(np.float32))
-        yamnet.invoke()
-        preds.append(yamnet.get_tensor(yamnet_output[0]['index'])[0])
+        preds = []
+        for start in range(0, len(audio_data) - YAMNET_INPUT_SIZE + 1, YAMNET_INPUT_SIZE):
+            chunk = audio_data[start:start + YAMNET_INPUT_SIZE]
+            yamnet.set_tensor(yamnet_input[0]['index'], chunk.astype(np.float32))
+            yamnet.invoke()
+            preds.append(yamnet.get_tensor(yamnet_output[0]['index'])[0])
 
-    if not preds:
+        if not preds:
+            return "unknown"
+
+        avg_preds = np.mean(preds, axis=0)
+        label_index = np.argmax(avg_preds)
+        sound_map = {0: "bark", 1: "meow", 2: "whine", 3: "growl"}
+        sound = sound_map.get(label_index, "unknown")
+
+        emotion = {"bark": "Hungry", "whine": "Anxious", "growl": "Angry"}.get(sound, "Happy")
+
+        print(f"[YAMNET] Sound: {sound} | Emotion: {emotion}")
+        return emotion
+    except:
         return "unknown"
-
-    avg_preds = np.mean(preds, axis=0)
-    label_index = np.argmax(avg_preds)
-    sound_map = {0: "bark", 1: "meow", 2: "whine", 3: "growl"}
-    sound = sound_map.get(label_index, "unknown")
-
-    if sound == "bark":
-        emotion = "Hungry"
-    elif sound == "whine":
-        emotion = "Anxious"
-    elif sound == "growl":
-        emotion = "Angry"
-    else:
-        emotion = "Happy"
-
-    print(f"[YAMNET] Sound: {sound} | Emotion: {emotion}")
-    return emotion
 
 def open_servo(servo, name):
     servo.max()
@@ -147,43 +160,54 @@ def handle_ultrasonic_food():
     payload = {"food_level": round(capacity, 1)}
     client.publish(topic, json.dumps(payload), qos=1)
 
+    lcd_display("Food Level:", f"{capacity:.1f}%")
+
 def handle_ultrasonic_door():
     distance_cm = ultrasonic_door.distance * 100
     print(f"[DOOR] Distance: {distance_cm:.1f} cm")
 
-    if distance_cm < 50:  
+    if distance_cm < 50:
         print("[MOTION] Detected near door! Capturing image...")
+        lcd_display("Motion Detected", "Checking...")
         img_path = capture_image(f"motion_{int(time.time())}.jpg")
         if is_pet_in_image(img_path):
             print("[PET] Pet detected near door. Closing door for safety.")
+            lcd_display("Pet Detected", "Door Closed")
             close_servo(servo_door, "Door Servo")
         else:
             print("[ALERT] Unknown motion detected. Door stays open.")
+            lcd_display("Unknown Motion", "Door Open")
             open_servo(servo_door, "Door Servo")
 
     topic = "tb/sensors/Door/data"
     payload = {"door_distance_cm": round(distance_cm, 1)}
     client.publish(topic, json.dumps(payload), qos=1)
 
+
 # Main Loop
 
 def main():
     print("Smart Pet Care System Started")
+    lcd_display("Smart Pet Care", "System Started")
+    sleep(2)
+
     try:
         while True:
             handle_ultrasonic_food()
             handle_ultrasonic_door()
 
-            # Detect sound-based emotion
             emotion = predict_sound_emotion()
 
             if emotion == "Hungry":
+                lcd_display("Emotion:", "Hungry ")
                 feed_pet()
             elif emotion in ["Angry", "Anxious"]:
+                lcd_display("Emotion:", f"{emotio}⚠ ")
                 close_servo(servo_door, "Door Servo")
                 capture_image(f"alert_{int(time.time())}.jpg")
+            else:
+                lcd_display("Emotion:", f"{emotion} ")
 
-            # Publish emotion to MQTT
             payload = {"emotion": emotion, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
             client.publish("tb/sensors/Emotion/data", json.dumps(payload), qos=1)
             print("[MQTT] Published emotion data:", payload)
@@ -193,9 +217,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nSystem stopped by user.")
+        lcd_display("System", "Stopped")
         servo_food.detach()
         servo_door.detach()
-
 
 if __name__ == "__main__":
     main()
